@@ -1,0 +1,634 @@
+<script>
+/**
+ * SIVERA — logika front-end Apps Script.
+ * Semua akses data melalui google.script.run (fungsi di Code.gs).
+ */
+const STATE = {
+  role: 'kasir',
+  nama: 'Rani Puspita',
+  units: [],
+  setoran: [],
+  kalender: null,
+  pengaturan: {},
+  kategoriFilter: 'semua',
+  selected: [],
+  slipTab: 'harian',
+  slipResult: null,
+  slipRows: [],
+};
+
+const KATEGORI = {
+  ka: { label: 'Kereta Api', badge: 'badge-ka', icon: '🚆' },
+  parkir: { label: 'Parkir', badge: 'badge-parkir', icon: '🅿️' },
+  cafe: { label: 'Loko Cafe', badge: 'badge-cafe', icon: '☕' },
+  booth: { label: 'Booth Loko', badge: 'badge-booth', icon: '🛍️' },
+};
+
+function run(fn, ...args) {
+  return new Promise(function (resolve, reject) {
+    google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(reject)[fn].apply(null, args);
+  });
+}
+
+function rupiah(value) {
+  return 'Rp ' + (Number(value) || 0).toLocaleString('id-ID');
+}
+
+function tanggalLabel(value) {
+  if (!value) return '-';
+  const iso = String(value).slice(0, 10);
+  const bulan = ['Januari','Februari','Maret','April','Mei','Juni','Juli','Agustus','September','Oktober','November','Desember'];
+  const parts = iso.split('-');
+  return Number(parts[2]) + ' ' + bulan[Number(parts[1]) - 1] + ' ' + parts[0];
+}
+
+function todayISO() {
+  const now = new Date();
+  const offset = now.getTimezoneOffset() * 60000;
+  return new Date(now.getTime() - offset).toISOString().slice(0, 10);
+}
+
+function esc(text) {
+  return String(text === undefined || text === null ? '' : text)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function toast(message) {
+  const el = document.getElementById('toast');
+  el.textContent = message;
+  el.classList.remove('hidden');
+  setTimeout(function () { el.classList.add('hidden'); }, 3200);
+}
+
+function badgeKategori(kategori) {
+  const meta = KATEGORI[kategori] || KATEGORI.ka;
+  return '<span class="badge ' + meta.badge + '">' + meta.icon + ' ' + meta.label + '</span>';
+}
+
+function badgeStatus(status) {
+  const label = status === 'terverifikasi' ? 'Terverifikasi' : status === 'selisih' ? 'Selisih' : 'Menunggu';
+  return '<span class="badge badge-' + status + '">' + label + '</span>';
+}
+
+/** ====================== BOOTSTRAP ====================== */
+async function refreshAll() {
+  try {
+    const data = await run('getBootstrap', STATE.role, STATE.nama);
+    STATE.units = data.units || [];
+    STATE.setoran = data.setoran || [];
+    STATE.kalender = data.kalender || null;
+    STATE.pengaturan = data.pengaturan || {};
+    renderSemua();
+    toast('Data dimuat: ' + STATE.units.length + ' unit');
+  } catch (err) {
+    toast('Gagal memuat data: ' + err);
+  }
+}
+
+function renderSemua() {
+  renderDashboard();
+  renderUnitSelects();
+  renderInputTerakhir();
+  renderVerifikasi();
+  renderKalender();
+  renderSlipSumber();
+}
+
+/** ====================== DASHBOARD ====================== */
+function renderDashboard() {
+  const status = { menunggu: 0, terverifikasi: 0, selisih: 0 };
+  const kategori = {};
+  let total = 0;
+
+  STATE.setoran.forEach(function (row) {
+    const nominal = Number(row.total) || 0;
+    total += nominal;
+    status[row.status] = (status[row.status] || 0) + 1;
+    const key = row.kategori || 'ka';
+    if (!kategori[key]) kategori[key] = { total: 0, jumlah: 0, menunggu: 0 };
+    kategori[key].total += nominal;
+    kategori[key].jumlah += 1;
+    if (row.status === 'menunggu') kategori[key].menunggu += 1;
+  });
+
+  document.getElementById('dashKategori').innerHTML = Object.keys(KATEGORI).map(function (key) {
+    const data = kategori[key] || { total: 0, jumlah: 0, menunggu: 0 };
+    const unitCount = STATE.units.filter(function (unit) { return unit.kategori === key; }).length;
+    const share = total > 0 ? (data.total / total) * 100 : 0;
+    return '' +
+      '<div class="rounded-xl border border-slate-200 bg-white p-3">' +
+        '<div class="flex items-center justify-between">' + badgeKategori(key) +
+          '<span class="text-[10px] text-slate-400">' + unitCount + ' unit</span></div>' +
+        '<p class="mt-2 text-sm font-extrabold text-slate-900">' + rupiah(data.total) + '</p>' +
+        '<div class="mt-1.5 h-1.5 overflow-hidden rounded bg-slate-100"><div class="h-full bg-amber-400" style="width:' + share.toFixed(1) + '%"></div></div>' +
+        '<p class="mt-1 text-[10px] text-slate-500">' + share.toFixed(1) + '% · ' + data.jumlah + ' setoran · ' + data.menunggu + ' menunggu</p>' +
+      '</div>';
+  }).join('');
+
+  const antrean = STATE.setoran.filter(function (row) { return row.status === 'menunggu'; }).slice(0, 6);
+  document.getElementById('dashAntrean').innerHTML = antrean.length === 0
+    ? '<p class="py-4 text-center text-xs text-slate-400">Tidak ada antrean 🎉</p>'
+    : antrean.map(function (row) {
+        return '' +
+          '<div class="flex items-center gap-2 py-2">' +
+            '<div class="min-w-0 flex-1"><p class="truncate text-xs font-semibold">' + esc(row.nama_unit) + ' ' + badgeKategori(row.kategori) + '</p>' +
+            '<p class="text-[10px] text-slate-500">' + tanggalLabel(row.tanggal_dinas) + ' · ' + esc(row.petugas) + '</p></div>' +
+            '<span class="text-xs font-bold">' + rupiah(row.total) + '</span>' +
+          '</div>';
+      }).join('');
+
+  const totalStatus = Object.keys(status).reduce(function (sum, key) { return sum + status[key]; }, 0) || 1;
+  document.getElementById('dashStatus').innerHTML = Object.keys(status).map(function (key) {
+    return '' +
+      '<div>' +
+        '<div class="flex items-center justify-between text-[11px]"><span>' + badgeStatus(key) + '</span><span class="font-bold">' + status[key] + '</span></div>' +
+        '<div class="mt-1 h-1.5 overflow-hidden rounded bg-slate-100"><div class="h-full ' +
+          (key === 'terverifikasi' ? 'bg-emerald-500' : key === 'menunggu' ? 'bg-amber-400' : 'bg-rose-500') +
+          '" style="width:' + ((status[key] / totalStatus) * 100).toFixed(1) + '%"></div></div>' +
+      '</div>';
+  }).join('') + '<p class="mt-2 text-[10px] text-slate-400">Total nilai: ' + rupiah(total) + '</p>';
+}
+
+/** ====================== INPUT ====================== */
+function renderUnitSelects() {
+  const chips = ['semua', 'ka', 'parkir', 'cafe', 'booth'].map(function (key) {
+    const label = key === 'semua' ? 'Semua' : KATEGORI[key].label;
+    const count = key === 'semua' ? STATE.units.length : STATE.units.filter(function (u) { return u.kategori === key; }).length;
+    return '<button type="button" class="chip ' + (STATE.kategoriFilter === key ? 'active' : '') + '" onclick="setKategoriInput(\'' + key + '\')">' + label + ' <span class="opacity-60">' + count + '</span></button>';
+  }).join('');
+  document.getElementById('kategoriChips').innerHTML = chips;
+
+  const term = (document.getElementById('cariUnit').value || '').toLowerCase();
+  const list = STATE.units.filter(function (unit) {
+    if (STATE.kategoriFilter !== 'semua' && unit.kategori !== STATE.kategoriFilter) return false;
+    if (!term) return true;
+    return (unit.nama_unit + ' ' + unit.nomor_unit + ' ' + unit.relasi).toLowerCase().indexOf(term) >= 0;
+  });
+  document.getElementById('unitId').innerHTML = list.map(function (unit) {
+    return '<option value="' + unit.id + '">' + esc(unit.nama_unit) + ' — ' + esc(unit.nomor_unit) + ' (' + (KATEGORI[unit.kategori] || KATEGORI.ka).label + ')</option>';
+  }).join('');
+
+  const slipSelect = document.getElementById('slipUnit');
+  if (slipSelect) {
+    slipSelect.innerHTML = '<option value="">— pilih unit —</option>' + STATE.units.map(function (unit) {
+      return '<option value="' + unit.id + '">[' + (KATEGORI[unit.kategori] || KATEGORI.ka).label + '] ' + esc(unit.nama_unit) + '</option>';
+    }).join('');
+  }
+  updateTotal();
+}
+
+function setKategoriInput(key) {
+  STATE.kategoriFilter = key;
+  renderUnitSelects();
+}
+
+function parseNominal(text) {
+  const digits = String(text || '').replace(/[^\d]/g, '');
+  return digits ? Number(digits) : 0;
+}
+
+function updateTotal() {
+  const tunai = parseNominal(document.getElementById('tunai').value);
+  const nonTunai = parseNominal(document.getElementById('nonTunai').value);
+  const total = tunai + nonTunai;
+  document.getElementById('totalPreview').textContent = rupiah(total);
+  document.getElementById('totalBesar').textContent = rupiah(total);
+  const selected = document.getElementById('unitId');
+  const unit = STATE.units.filter(function (u) { return selected && String(u.id) === String(selected.value); })[0];
+  document.getElementById('ringkasUnit').textContent = unit
+    ? unit.nama_unit + ' · ' + unit.nomor_unit + ' · ' + (KATEGORI[unit.kategori] || KATEGORI.ka).label
+    : 'Belum ada unit dipilih';
+}
+
+function renderInputTerakhir() {
+  const rows = STATE.setoran.slice(0, 6);
+  document.getElementById('inputTerakhir').innerHTML = rows.length === 0
+    ? '<p class="py-3 text-center text-[11px] text-slate-400">Belum ada setoran</p>'
+    : rows.map(function (row) {
+        return '<div class="flex items-center gap-2 py-1.5"><div class="min-w-0 flex-1"><p class="truncate text-[11px] font-semibold">' + esc(row.nama_unit) + '</p>' +
+          '<p class="text-[10px] text-slate-400">' + tanggalLabel(row.tanggal_dinas) + '</p></div>' +
+          '<span class="text-[11px] font-bold">' + rupiah(row.total) + '</span>' + badgeStatus(row.status) + '</div>';
+      }).join('');
+}
+
+function readFileBase64(file) {
+  return new Promise(function (resolve) {
+    if (!file) return resolve(null);
+    const reader = new FileReader();
+    reader.onload = function () { resolve(reader.result); };
+    reader.onerror = function () { resolve(null); };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function submitSetoran(event) {
+  event.preventDefault();
+  const msg = document.getElementById('inputMsg');
+  msg.className = 'text-xs text-slate-500';
+  msg.textContent = 'Menyimpan…';
+
+  const file = document.getElementById('bukti').files[0];
+  const base64 = await readFileBase64(file);
+
+  const payload = {
+    tanggal_dinas: document.getElementById('tanggal').value,
+    unit_id: document.getElementById('unitId').value,
+    shift: document.getElementById('shift').value,
+    petugas: document.getElementById('petugas').value,
+    tunai: parseNominal(document.getElementById('tunai').value),
+    non_tunai: parseNominal(document.getElementById('nonTunai').value),
+    bukti_base64: base64,
+    bukti_nama: file ? file.name : '',
+    dibuat_oleh: STATE.nama,
+  };
+
+  try {
+    const result = await run('simpanSetoran', payload);
+    if (!result.ok) {
+      msg.className = 'text-xs font-semibold text-rose-600';
+      msg.textContent = result.message;
+      return;
+    }
+    msg.className = 'text-xs font-semibold text-emerald-600';
+    msg.textContent = result.message + ' · ' + result.data.kode_setoran;
+    document.getElementById('formSetoran').reset();
+    document.getElementById('petugas').value = STATE.nama;
+    document.getElementById('tanggal').value = todayISO();
+    await refreshAll();
+  } catch (err) {
+    msg.className = 'text-xs font-semibold text-rose-600';
+    msg.textContent = 'Gagal menyimpan: ' + err;
+  }
+}
+
+/** ====================== VERIFIKASI ====================== */
+function dataVerifikasi() {
+  const status = document.getElementById('filterStatus').value;
+  const kategori = document.getElementById('filterKategori').value;
+  const tanggal = document.getElementById('filterTanggal').value;
+  return STATE.setoran.filter(function (row) {
+    if (status && row.status !== status) return false;
+    if (kategori && row.kategori !== kategori) return false;
+    if (tanggal && String(row.tanggal_dinas).slice(0, 10) !== tanggal) return false;
+    return true;
+  });
+}
+
+function renderVerifikasi() {
+  const rows = dataVerifikasi();
+  const head = '<thead><tr>' +
+    '<th class="th" style="width:28px"><input type="checkbox" onchange="toggleSemua(this.checked)"></th>' +
+    '<th class="th">Tanggal</th><th class="th">Unit</th><th class="th">Petugas</th>' +
+    '<th class="th num">Tunai</th><th class="th num">Non-Tunai</th><th class="th num">Total</th>' +
+    '<th class="th">Status</th><th class="th">Verifikator</th><th class="th">Aksi</th></tr></thead>';
+
+  const body = rows.length === 0
+    ? '<tr><td class="cell text-center text-slate-400" colspan="10">Tidak ada data pada filter ini</td></tr>'
+    : rows.map(function (row) {
+        return '<tr>' +
+          '<td class="cell"><input type="checkbox" class="rowCheck" value="' + row.id + '" ' +
+            (row.status !== 'menunggu' ? 'disabled' : '') + ' onchange="togglePilih(this)"></td>' +
+          '<td class="cell whitespace-nowrap">' + tanggalLabel(row.tanggal_dinas) + '</td>' +
+          '<td class="cell"><span class="font-semibold">' + esc(row.nama_unit) + '</span> ' + badgeKategori(row.kategori) +
+            '<div class="text-[10px] text-slate-400">' + esc(row.nomor_unit) + ' · ' + esc(row.layanan) + '</div></td>' +
+          '<td class="cell">' + esc(row.petugas) + '<div class="text-[10px] text-slate-400">Shift ' + esc(row.shift) + '</div></td>' +
+          '<td class="cell num">' + rupiah(row.tunai) + '</td>' +
+          '<td class="cell num">' + rupiah(row.non_tunai) + '</td>' +
+          '<td class="cell num font-bold">' + rupiah(row.total) + '</td>' +
+          '<td class="cell">' + badgeStatus(row.status) + '</td>' +
+          '<td class="cell">' + esc(row.verifikator || '-') + '<div class="text-[10px] text-slate-400">' + esc(row.verified_at || '') + '</div></td>' +
+          '<td class="cell"><button class="rounded bg-slate-900 px-2 py-1 text-[10px] font-bold text-white" onclick="bukaDetail(\'' + row.id + '\')">Detail</button></td>' +
+        '</tr>';
+      }).join('');
+
+  document.getElementById('verifTable').innerHTML = '<table class="w-full min-w-[860px]">' + head + '<tbody>' + body + '</tbody></table>';
+}
+
+function togglePilih(input) {
+  if (input.checked) {
+    if (STATE.selected.indexOf(input.value) < 0) STATE.selected.push(input.value);
+  } else {
+    STATE.selected = STATE.selected.filter(function (id) { return id !== input.value; });
+  }
+}
+
+function toggleSemua(checked) {
+  STATE.selected = [];
+  if (checked) {
+    dataVerifikasi().forEach(function (row) { if (row.status === 'menunggu') STATE.selected.push(String(row.id)); });
+  }
+  renderVerifikasi();
+}
+
+async function verifikasiMassalUI() {
+  if (STATE.selected.length === 0) {
+    toast('Centang dulu setoran yang akan diverifikasi');
+    return;
+  }
+  if (!confirm('Setujui ' + STATE.selected.length + ' setoran sebagai TERVERIFIKASI?')) return;
+  const result = await run('verifikasiMassal', { ids: STATE.selected, verifikator: STATE.nama });
+  toast(result.message || 'Selesai');
+  STATE.selected = [];
+  await refreshAll();
+}
+
+function bukaDetail(id) {
+  const row = STATE.setoran.filter(function (item) { return String(item.id) === String(id); })[0];
+  if (!row) return;
+  document.getElementById('modalTitle').innerHTML = esc(row.nama_unit) + ' ' + badgeKategori(row.kategori) + ' ' + badgeStatus(row.status);
+  document.getElementById('modalBody').innerHTML = '' +
+    '<div class="grid grid-cols-2 gap-2 rounded-lg bg-slate-50 p-2.5">' +
+      '<div><p class="text-[10px] uppercase text-slate-400">Tanggal dinas</p><p class="font-semibold">' + tanggalLabel(row.tanggal_dinas) + '</p></div>' +
+      '<div><p class="text-[10px] uppercase text-slate-400">Kode setoran</p><p class="font-mono text-[11px]">' + esc(row.kode_setoran) + '</p></div>' +
+      '<div><p class="text-[10px] uppercase text-slate-400">Tunai</p><p class="font-semibold">' + rupiah(row.tunai) + '</p></div>' +
+      '<div><p class="text-[10px] uppercase text-slate-400">Non-tunai</p><p class="font-semibold">' + rupiah(row.non_tunai) + '</p></div>' +
+      '<div class="col-span-2"><p class="text-[10px] uppercase text-slate-400">Total setoran</p><p class="text-lg font-extrabold">' + rupiah(row.total) + '</p></div>' +
+    '</div>' +
+    (row.bukti_url
+      ? '<a href="' + esc(row.bukti_url) + '" target="_blank" class="text-[11px] font-semibold text-blue-600 underline">Lihat bukti setor di Drive ↗</a>'
+      : '<p class="text-[11px] text-slate-400">Tidak ada bukti terlampir.</p>') +
+    (row.status === 'menunggu'
+      ? '<div class="space-y-2 rounded-lg border border-slate-200 p-2.5">' +
+          '<label class="lbl">Nama Kasir (Verifikator)</label>' +
+          '<input id="vNama" class="inp" value="' + esc(STATE.nama) + '">' +
+          '<div class="grid grid-cols-2 gap-1.5">' +
+            '<button class="rounded bg-emerald-600 px-2 py-2 text-[11px] font-bold text-white" onclick="aksiVerifikasi(\'' + row.id + '\',\'setujui\')">✓ Setujui</button>' +
+            '<button class="rounded border border-rose-300 bg-rose-50 px-2 py-2 text-[11px] font-bold text-rose-700" onclick="formRevisi(\'' + row.id + '\')">! Revisi / Selisih</button>' +
+          '</div>' +
+          '<div id="revisiBox" class="hidden space-y-1.5 rounded bg-rose-50 p-2">' +
+            '<select id="vJenis" class="inp"><option value="kurang">Kurang Setor</option><option value="lebih">Lebih Setor</option></select>' +
+            '<input id="vNominal" class="inp text-right" placeholder="Nominal selisih">' +
+            '<textarea id="vCatatan" class="inp" rows="2" placeholder="Catatan untuk petugas"></textarea>' +
+            '<button class="w-full rounded bg-rose-600 px-2 py-2 text-[11px] font-bold text-white" onclick="aksiVerifikasi(\'' + row.id + '\',\'revisi\')">Kirim Revisi</button>' +
+          '</div>' +
+        '</div>'
+      : '<div class="rounded-lg bg-slate-50 p-2.5 text-[11px]">Diverifikasi oleh <strong>' + esc(row.verifikator || '-') + '</strong> pada ' + esc(row.verified_at || '-') +
+        (row.catatan_verifikator ? '<div class="mt-1 italic">"' + esc(row.catatan_verifikator) + '"</div>' : '') + '</div>');
+
+  document.getElementById('modal').classList.remove('hidden');
+  document.getElementById('modal').classList.add('flex');
+}
+
+function tutupModal() {
+  document.getElementById('modal').classList.add('hidden');
+  document.getElementById('modal').classList.remove('flex');
+}
+
+function formRevisi() {
+  document.getElementById('revisiBox').classList.remove('hidden');
+}
+
+async function aksiVerifikasi(id, aksi) {
+  const verifikator = (document.getElementById('vNama') || {}).value || STATE.nama;
+  const payload = { id: id, aksi: aksi, verifikator: verifikator };
+  if (aksi === 'revisi') {
+    payload.jenis_selisih = document.getElementById('vJenis').value;
+    payload.nominal_selisih = parseNominal(document.getElementById('vNominal').value);
+    payload.catatan = document.getElementById('vCatatan').value;
+  }
+  const result = await run('verifikasiSetoran', payload);
+  toast(result.message || 'Selesai');
+  if (result.ok) {
+    tutupModal();
+    await refreshAll();
+  }
+}
+
+/** ====================== KALENDER ====================== */
+function renderKalender() {
+  const bulanInput = document.getElementById('bulanKalender');
+  const bulan = bulanInput.value || todayISO().slice(0, 7);
+  const days = (STATE.kalender && STATE.kalender.bulan === bulan) ? STATE.kalender.days : null;
+
+  if (!days) {
+    run('getKalender', bulan).then(function (result) {
+      STATE.kalender = result;
+      renderKalender();
+    });
+    document.getElementById('kalenderGrid').innerHTML = '<p class="p-4 text-center text-xs text-slate-400">Memuat kalender…</p>';
+    return;
+  }
+
+  const totalUnit = STATE.kalender.totalUnit || STATE.units.filter(function (u) { return u.status_aktif !== false; }).length;
+  const [tahun, bulanAngka] = bulan.split('-').map(Number);
+  const jumlahHari = new Date(tahun, bulanAngka, 0).getDate();
+  const offset = (new Date(tahun, bulanAngka - 1, 1).getDay() + 6) % 7;
+  const hari = ['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'];
+
+  let html = '<div class="grid grid-cols-7 gap-1 text-center text-[10px] font-bold uppercase text-slate-500">' +
+    hari.map(function (h) { return '<div class="py-1">' + h + '</div>'; }).join('') + '</div>' +
+    '<div class="mt-1 grid grid-cols-7 gap-1">';
+
+  for (let i = 0; i < offset; i += 1) html += '<div class="cal-day empty"></div>';
+  for (let d = 1; d <= jumlahHari; d += 1) {
+    const iso = bulan + '-' + String(d).padStart(2, '0');
+    const day = days[iso];
+    const tone = !day || day.jumlah === 0 ? 'empty' : day.selisih > 0 ? 'selisih' : day.menunggu > 0 ? 'menunggu' : 'lengkap';
+    html += '<button type="button" class="cal-day ' + tone + '" onclick="lihatTanggal(\'' + iso + '\')">' +
+      '<div class="flex items-center justify-between"><span class="font-bold">' + d + '</span>' + (day ? '<span class="text-[9px]">' + day.jumlah + '/' + totalUnit + '</span>' : '') + '</div>' +
+      (day ? '<div class="mt-1 text-[9px] font-semibold">' + rupiah(day.total) + '</div>' : '') +
+      '</button>';
+  }
+  html += '</div>';
+  document.getElementById('kalenderGrid').innerHTML = html;
+}
+
+function lihatTanggal(iso) {
+  const rows = STATE.setoran.filter(function (row) { return String(row.tanggal_dinas).slice(0, 10) === iso; });
+  const total = rows.reduce(function (sum, row) { return sum + (Number(row.total) || 0); }, 0);
+  document.getElementById('kalenderDetail').innerHTML = '' +
+    '<div class="rounded-xl border border-slate-200 bg-white p-3">' +
+      '<div class="flex flex-wrap items-center justify-between gap-2"><h3 class="text-sm font-bold">Rincian ' + tanggalLabel(iso) + '</h3>' +
+      '<span class="text-xs font-bold">' + rows.length + ' unit · ' + rupiah(total) + '</span></div>' +
+      '<div class="mt-2 divide-y divide-slate-100 text-xs">' +
+        (rows.length === 0 ? '<p class="py-3 text-center text-slate-400">Belum ada setoran</p>' : rows.map(function (row) {
+          return '<div class="flex items-center gap-2 py-1.5"><div class="min-w-0 flex-1"><p class="truncate font-semibold">' + esc(row.nama_unit) + ' ' + badgeKategori(row.kategori) + '</p>' +
+            '<p class="text-[10px] text-slate-500">' + esc(row.petugas) + ' · Shift ' + esc(row.shift) + '</p></div>' +
+            '<span class="font-bold">' + rupiah(row.total) + '</span>' + badgeStatus(row.status) + '</div>';
+        }).join('')) +
+      '</div>' +
+    '</div>';
+}
+
+/** ====================== SLIP ====================== */
+function renderSlipSumber() {
+  const rows = STATE.setoran.filter(function (row) { return row.status === 'terverifikasi'; });
+  STATE.slipRows = rows;
+  const head = '<thead><tr><th class="th" style="width:28px"></th><th class="th">Tanggal</th><th class="th">Unit</th><th class="th">Petugas</th>' +
+    '<th class="th num">Tunai</th><th class="th num">Non-Tunai</th><th class="th num">Total</th><th class="th">Verifikator</th></tr></thead>';
+  const body = rows.length === 0
+    ? '<tr><td class="cell text-center text-slate-400" colspan="8">Belum ada data terverifikasi</td></tr>'
+    : rows.slice(0, 300).map(function (row) {
+        return '<tr><td class="cell"><input type="checkbox" class="slipCheck" value="' + row.id + '"></td>' +
+          '<td class="cell whitespace-nowrap">' + tanggalLabel(row.tanggal_dinas) + '</td>' +
+          '<td class="cell"><span class="font-semibold">' + esc(row.nama_unit) + '</span> ' + badgeKategori(row.kategori) + '</td>' +
+          '<td class="cell">' + esc(row.petugas) + '</td>' +
+          '<td class="cell num">' + rupiah(row.tunai) + '</td>' +
+          '<td class="cell num">' + rupiah(row.non_tunai) + '</td>' +
+          '<td class="cell num font-bold">' + rupiah(row.total) + '</td>' +
+          '<td class="cell">' + esc(row.verifikator || '-') + '</td></tr>';
+      }).join('');
+  document.getElementById('slipSumber').innerHTML = '<table class="w-full min-w-[820px]">' + head + '<tbody>' + body + '</tbody></table>';
+}
+
+function slipTabUI(tab) {
+  STATE.slipTab = tab;
+  document.querySelectorAll('.sliptab').forEach(function (button) {
+    button.classList.toggle('active', button.dataset.sliptab === tab);
+  });
+  document.getElementById('slipPanelHarian').classList.toggle('hidden', tab !== 'harian');
+  document.getElementById('slipPanelUnit').classList.toggle('hidden', tab !== 'per_unit');
+  document.getElementById('slipPanelGabungan').classList.toggle('hidden', tab !== 'gabungan');
+}
+
+async function terbitkanSlip() {
+  const msg = document.getElementById('slipMsg');
+  msg.className = 'text-xs text-slate-500';
+  msg.textContent = 'Memproses…';
+
+  const payload = { jenis: STATE.slipTab, dicetak_oleh: STATE.nama };
+  if (STATE.slipTab === 'harian') {
+    payload.tanggal = document.getElementById('slipTanggal').value || todayISO();
+  } else if (STATE.slipTab === 'per_unit') {
+    payload.unit_id = document.getElementById('slipUnit').value;
+    payload.dari = document.getElementById('slipDari').value;
+    payload.sampai = document.getElementById('slipSampai').value;
+    if (!payload.unit_id) { msg.className = 'text-xs font-semibold text-rose-600'; msg.textContent = 'Pilih unit terlebih dahulu'; return; }
+  } else {
+    const ids = Array.prototype.slice.call(document.querySelectorAll('.slipCheck:checked')).map(function (input) { return input.value; });
+    if (ids.length === 0) { msg.className = 'text-xs font-semibold text-rose-600'; msg.textContent = 'Centang minimal satu data'; return; }
+    payload.ids = ids;
+  }
+
+  const result = await run('buatSlip', payload);
+  if (!result.ok) {
+    msg.className = 'text-xs font-semibold text-rose-600';
+    msg.textContent = result.message;
+    return;
+  }
+
+  STATE.slipResult = result;
+  msg.className = 'text-xs font-semibold text-emerald-600';
+  msg.textContent = result.message;
+  renderSlip(result);
+  toast('Slip diterbitkan: ' + result.data.nomor_referensi);
+}
+
+function renderSlip(result) {
+  const slip = result.data;
+  const snapshot = result.snapshot;
+  const validasiUrl = (result.web_app_url || '') + '?api=slip&token=' + slip.token;
+  const qrUrl = 'https://quickchart.io/qr?size=140&text=' + encodeURIComponent(validasiUrl);
+
+  document.getElementById('slipHasil').innerHTML = '' +
+    '<div class="no-print mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs">' +
+      '<span class="font-bold text-emerald-800">' + esc(slip.nomor_referensi) + ' · ' + esc(slip.terbilang) + '</span>' +
+      '<button onclick="window.print()" class="rounded bg-slate-900 px-3 py-1.5 font-bold text-white">Cetak / PDF</button>' +
+    '</div>' +
+    '<div class="sheet">' +
+      '<div style="display:flex;gap:10px;align-items:flex-start;border-bottom:3px double #0f172a;padding-bottom:6px">' +
+        '<div style="width:44px;height:44px;border-radius:50%;background:#0f172a;color:#fbbf24;display:grid;place-items:center;font-size:20px">🚆</div>' +
+        '<div style="flex:1">' +
+          '<div style="font-size:13px;font-weight:800;text-transform:uppercase">' + esc(snapshot.unit.namaUnit) + '</div>' +
+          '<div style="font-size:8px;color:#64748b">' + esc(snapshot.unit.alamatUnit) + '</div>' +
+          '<div style="font-size:8px;letter-spacing:.06em">UNIT PENDAPATAN &amp; VERIFIKASI — KA · PARKIR · CAFE · BOOTH</div>' +
+        '</div>' +
+        '<div style="min-width:150px;background:#0f172a;color:#fff;padding:6px 8px;border-radius:6px">' +
+          '<div style="font-size:7px;color:#fcd34d;letter-spacing:.14em">NOMOR REFERENSI</div>' +
+          '<div style="font-size:11px;font-weight:700">' + esc(slip.nomor_referensi) + '</div>' +
+          '<div style="font-size:7px;opacity:.6;margin-top:3px">Tanggal cetak: ' + tanggalLabel(slip.created_at) + '</div>' +
+        '</div>' +
+      '</div>' +
+      '<div style="text-align:center;margin-top:8px">' +
+        '<div style="font-size:12px;font-weight:800;letter-spacing:.1em;text-transform:uppercase">SLIP SETORAN PENDAPATAN</div>' +
+        '<div style="font-size:8px;letter-spacing:.16em;color:#64748b;text-transform:uppercase">Data Terverifikasi · ' + esc(slip.jenis) + '</div>' +
+      '</div>' +
+      '<table style="margin-top:8px">' +
+        '<thead><tr><th style="width:18px">No</th><th style="width:52px">Tgl Dinas</th><th>Unit / KA</th><th style="width:80px">Petugas</th>' +
+        '<th style="width:70px">Tunai</th><th style="width:70px">Non-Tunai</th><th style="width:74px">Total</th><th style="width:70px">Verifikasi</th></tr></thead>' +
+        '<tbody>' + snapshot.rows.map(function (row, index) {
+          return '<tr><td style="text-align:center">' + (index + 1) + '</td>' +
+            '<td>' + esc(String(row.tanggal_dinas).slice(8, 10)) + '/' + esc(String(row.tanggal_dinas).slice(5, 7)) + '/' + esc(String(row.tanggal_dinas).slice(0, 4)) + '</td>' +
+            '<td><strong>' + (row.kategori === 'ka' ? 'KA ' + esc(row.nomor_unit) + ' · ' : '[' + (KATEGORI[row.kategori] || KATEGORI.ka).label + '] ') + esc(row.nama_unit) + '</strong>' +
+              '<div style="font-size:7px;color:#64748b">' + esc(row.layanan) + ' · ' + esc(row.relasi) + '</div></td>' +
+            '<td>' + esc(row.petugas) + '</td>' +
+            '<td style="text-align:right">' + rupiah(row.tunai) + '</td>' +
+            '<td style="text-align:right">' + rupiah(row.non_tunai) + '</td>' +
+            '<td style="text-align:right;font-weight:700">' + rupiah(row.total) + '</td>' +
+            '<td style="font-size:7px">' + esc(row.verifikator || '-') + '</td></tr>';
+        }).join('') + '</tbody>' +
+        '<tfoot><tr><td colspan="4" style="text-align:right;font-weight:700">GRAND TOTAL</td>' +
+          '<td style="text-align:right">' + rupiah(snapshot.totalTunai) + '</td>' +
+          '<td style="text-align:right">' + rupiah(snapshot.totalNonTunai) + '</td>' +
+          '<td style="text-align:right;font-weight:800">' + rupiah(snapshot.grandTotal) + '</td>' +
+          '<td style="text-align:center">' + snapshot.jumlah + ' data</td></tr></tfoot>' +
+      '</table>' +
+      '<div style="margin-top:6px;border:1px solid #cbd5e1;background:#f8fafc;padding:5px 7px;border-radius:5px">' +
+        '<div style="font-size:7px;letter-spacing:.12em;color:#64748b;text-transform:uppercase">Terbilang</div>' +
+        '<div style="font-size:10px;font-weight:700;font-style:italic">' + esc(slip.terbilang) + '</div>' +
+      '</div>' +
+      '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:14px;text-align:center;font-size:8px">' +
+        '<div><div>Disetorkan Oleh,</div><div style="font-size:7px;color:#94a3b8">PETUGAS SALES / CREW</div>' +
+          '<div style="margin-top:26px;border-top:1px dotted #94a3b8;padding-top:3px;font-weight:700">' + esc(snapshot.rows[0].petugas) + '</div></div>' +
+        '<div><div>Diverifikasi Oleh,</div><div style="font-size:7px;color:#94a3b8">KASIR (VERIFIKATOR)</div>' +
+          '<div style="margin-top:4px"><img src="' + qrUrl + '" style="width:52px;height:52px" alt="QR validasi"></div>' +
+          '<div style="border-top:1px dotted #94a3b8;padding-top:3px;font-weight:700">' + esc(snapshot.rows[0].verifikator || snapshot.unit.namaVerifikator) + '</div></div>' +
+        '<div><div>Diketahui Oleh,</div><div style="font-size:7px;color:#94a3b8">KEPALA UNIT / ADMIN</div>' +
+          '<div style="margin-top:26px;border-top:1px dotted #94a3b8;padding-top:3px;font-weight:700">' + esc(snapshot.unit.namaKepalaUnit) + '</div></div>' +
+      '</div>' +
+      '<div style="margin-top:8px;border-top:1px solid #cbd5e1;padding-top:4px;display:flex;justify-content:space-between;font-size:7px;color:#64748b">' +
+        '<span>Diterbitkan otomatis oleh SIVERA · hanya memuat setoran terverifikasi.</span>' +
+        '<span>Token validasi: <strong>' + esc(slip.token) + '</strong></span>' +
+      '</div>' +
+    '</div>';
+}
+
+/** ====================== INIT ====================== */
+document.addEventListener('DOMContentLoaded', function () {
+  document.querySelectorAll('.tab-btn').forEach(function (button) {
+    button.addEventListener('click', function () {
+      document.querySelectorAll('.tab-btn').forEach(function (item) { item.classList.remove('active'); });
+      button.classList.add('active');
+      document.querySelectorAll('.panel').forEach(function (panel) {
+        panel.classList.toggle('hidden', panel.dataset.panel !== button.dataset.tab);
+      });
+    });
+  });
+
+  document.querySelectorAll('.sliptab').forEach(function (button) {
+    button.addEventListener('click', function () { slipTabUI(button.dataset.sliptab); });
+  });
+
+  document.getElementById('tanggal').value = todayISO();
+  document.getElementById('slipTanggal').value = todayISO();
+  document.getElementById('slipDari').value = todayISO().slice(0, 7) + '-01';
+  document.getElementById('slipSampai').value = todayISO();
+  document.getElementById('bulanKalender').value = todayISO().slice(0, 7);
+  document.getElementById('filterTanggal').value = '';
+  document.getElementById('petugas').value = STATE.nama;
+
+  document.getElementById('formSetoran').addEventListener('submit', submitSetoran);
+  document.getElementById('tunai').addEventListener('input', updateTotal);
+  document.getElementById('nonTunai').addEventListener('input', updateTotal);
+  document.getElementById('unitId').addEventListener('change', updateTotal);
+  document.getElementById('cariUnit').addEventListener('input', renderUnitSelects);
+  document.getElementById('bulanKalender').addEventListener('change', renderKalender);
+  document.getElementById('role').addEventListener('change', function (event) {
+    STATE.role = event.target.value;
+    const contoh = { admin: 'Admin SIVERA', sales: 'Andi Pratama', crew: 'Bagus Nugroho', kasir: 'Rani Puspita' };
+    STATE.nama = contoh[STATE.role];
+    document.getElementById('namaUser').value = STATE.nama;
+    document.getElementById('petugas').value = STATE.nama;
+    toast('Mode peran: ' + STATE.role);
+  });
+  document.getElementById('namaUser').addEventListener('change', function (event) {
+    STATE.nama = event.target.value || 'Pengguna';
+    document.getElementById('petugas').value = STATE.nama;
+  });
+
+  slipTabUI('harian');
+  refreshAll();
+});
+</script>
